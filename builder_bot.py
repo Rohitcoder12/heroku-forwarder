@@ -1,4 +1,4 @@
-# builder_bot.py (Advanced Version)
+# builder_bot.py (Advanced Version - FINAL and COMPLETE)
 import os
 import asyncio
 import threading
@@ -6,7 +6,8 @@ import json
 import logging
 from flask import Flask
 from pyrogram import Client, filters
-from pyrogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
+# THIS IS THE CORRECTED, COMPLETE IMPORT LINE
+from pyrogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 
 # --- Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(name)s] - %(levelname)s - %(message)s')
@@ -22,13 +23,21 @@ def run_flask():
 # --- Environment Variable Loading ---
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 ADMIN_ID = int(os.environ.get('ADMIN_ID'))
+API_ID = int(os.environ.get('API_ID'))
+API_HASH = os.environ.get('API_HASH')
 
-if not BOT_TOKEN or not ADMIN_ID:
-    logger.critical("FATAL: BOT_TOKEN and ADMIN_ID must be set!")
+if not all([BOT_TOKEN, ADMIN_ID, API_ID, API_HASH]):
+    logger.critical("FATAL: BOT_TOKEN, ADMIN_ID, API_ID, and API_HASH must all be set!")
     exit()
 
 # --- Bot and State Management ---
-app = Client("config_builder_bot", bot_token=BOT_TOKEN, in_memory=True)
+app = Client(
+    "config_builder_bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN,
+    in_memory=True
+)
 admin_filter = filters.user(ADMIN_ID)
 builder_state = {} # Holds the configuration being built
 
@@ -55,7 +64,6 @@ def format_json_for_telegram(data):
 # --- Command Handlers ---
 @app.on_message(filters.command("start") & admin_filter)
 async def start_command(client, message: Message):
-    # Initialize state for the user
     builder_state[ADMIN_ID] = {"rules": [], "state": "idle"}
     await message.reply_text(
         "👋 **Welcome to the Advanced Config Builder!**\n\n"
@@ -66,14 +74,14 @@ async def start_command(client, message: Message):
 @app.on_message(filters.command("addrule") & admin_filter)
 async def add_rule_command(client, message: Message):
     if ADMIN_ID not in builder_state:
-        await start_command(client, message) # Re-initialize if state is lost
+        await start_command(client, message)
     
     state = builder_state[ADMIN_ID]
     state["state"] = "awaiting_rule_name"
     await message.reply_text(
         "**Step 1: Rule Name**\n\n"
         "Please enter a unique name for this new rule (e.g., `crypto_news`). No spaces.",
-        reply_markup=ReplyKeyboardRemove() # Remove the main keyboard
+        reply_markup=ReplyKeyboardRemove()
     )
 
 @app.on_message(filters.command("deleterule") & admin_filter)
@@ -92,7 +100,6 @@ async def delete_rule_command(client, message: Message):
     )
     state["state"] = "awaiting_deletion"
     await message.reply_text("Which rule would you like to delete?", reply_markup=keyboard)
-
 
 @app.on_message(filters.command("view") & admin_filter)
 async def view_command(client, message: Message):
@@ -122,7 +129,8 @@ async def finish_command(client, message: Message):
         reply_markup=ReplyKeyboardRemove()
     )
     await message.reply_text(format_json_for_telegram(final_json))
-    del builder_state[ADMIN_ID] # Clean up state
+    if ADMIN_ID in builder_state:
+        del builder_state[ADMIN_ID]
 
 # --- Main Handler for Building Steps ---
 @app.on_message(filters.private & admin_filter & ~filters.command(["start"]))
@@ -133,7 +141,6 @@ async def handle_builder_steps(client, message: Message):
     current_state = state.get("state")
     user_input = message.text
 
-    # Handle /skip command
     if user_input.lower() == '/skip':
         if current_state == "awaiting_keywords":
             state["state"] = "awaiting_replacements"
@@ -154,23 +161,17 @@ async def handle_builder_steps(client, message: Message):
             )
         return
 
-    # FSM (Finite State Machine) for building a rule
     if current_state == "awaiting_rule_name":
-        state["current_rule"] = {"name": user_input} # Add name to the rule
+        state["current_rule"] = {"name": user_input}
         state["state"] = "awaiting_sources"
-        await message.reply_text(
-            "**Step 2: Sources**\n\nSend the chat IDs to forward **FROM**, separated by spaces."
-        )
+        await message.reply_text("**Step 2: Sources**\n\nSend the chat IDs to forward **FROM**, separated by spaces.")
     elif current_state == "awaiting_sources":
         try:
             state["current_rule"]["from_chats"] = [int(i) for i in user_input.split()]
             state["state"] = "awaiting_destinations"
-            await message.reply_text(
-                "**Step 3: Destinations**\n\nSend the chat IDs to forward **TO**, separated by spaces."
-            )
+            await message.reply_text("**Step 3: Destinations**\n\nSend the chat IDs to forward **TO**, separated by spaces.")
         except ValueError:
             await message.reply_text("❌ Invalid ID. Please send only numbers separated by spaces.")
-    
     elif current_state == "awaiting_destinations":
         try:
             state["current_rule"]["to_chats"] = [int(i) for i in user_input.split()]
@@ -184,7 +185,6 @@ async def handle_builder_steps(client, message: Message):
             )
         except ValueError:
             await message.reply_text("❌ Invalid ID. Please send only numbers separated by spaces.")
-
     elif current_state == "awaiting_keywords":
         state["current_rule"]["keywords"] = [k.strip() for k in user_input.split(',')]
         state["state"] = "awaiting_replacements"
@@ -196,14 +196,14 @@ async def handle_builder_steps(client, message: Message):
             "Press /skip to ignore.",
             reply_markup=SKIP_KEYBOARD
         )
-    
     elif current_state == "awaiting_replacements":
         replacements = {}
         for line in user_input.split('\n'):
             if '==' in line:
                 old, new = line.split('==', 1)
                 replacements[old.strip()] = new.strip()
-        state["current_rule"]["replacements"] = replacements
+        if replacements:
+            state["current_rule"]["replacements"] = replacements
         
         state["rules"].append(state["current_rule"])
         state["current_rule"] = {}
@@ -212,14 +212,11 @@ async def handle_builder_steps(client, message: Message):
             f"✅ **Rule '{state['rules'][-1]['name']}' Saved!**\n\nUse the menu to add another rule or finish.",
             reply_markup=MAIN_KEYBOARD
         )
-    
     elif current_state == "awaiting_deletion":
         rule_to_delete = user_input
-        # Find the rule and remove it
         state["rules"] = [rule for rule in state["rules"] if rule.get("name") != rule_to_delete]
         state["state"] = "idle"
         await message.reply_text(f"Rule '{rule_to_delete}' has been deleted.", reply_markup=MAIN_KEYBOARD)
-
 
 # --- Main Application Start ---
 if __name__ == "__main__":
