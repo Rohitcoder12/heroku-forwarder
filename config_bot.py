@@ -1,4 +1,4 @@
-# config_bot.py (FINAL DIAGNOSTIC VERSION)
+# config_bot.py (FINAL - All Commands Included)
 import os
 import threading
 import json
@@ -33,31 +33,99 @@ KOYEB_HEADERS = {"Authorization": f"Bearer {KOYEB_API_TOKEN}", "Content-Type": "
 app = Client("config_bot_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True)
 admin_filter = filters.user(ADMIN_ID)
 
-# --- Bot Command Handlers ---
+# --- Koyeb API Functions ---
+def get_current_definition():
+    try:
+        response = requests.get(KOYEB_API_URL, headers=KOYEB_HEADERS)
+        response.raise_for_status()
+        return response.json().get("service", {}).get("definition", {})
+    except Exception as e:
+        logger.error(f"Failed to get Koyeb service definition: {e}")
+        return None
 
-# NEW DIAGNOSTIC COMMAND - NO FILTER
+def update_koyeb_env(new_env_vars):
+    payload = {"definition": {"env": new_env_vars}}
+    try:
+        response = requests.patch(KOYEB_API_URL, headers=KOYEB_HEADERS, json=payload)
+        response.raise_for_status()
+        return True
+    except Exception as e:
+        logger.error(f"Failed to update Koyeb config: {e} - Response: {response.text}")
+        return False
+
+# --- Bot Command Handlers ---
 @app.on_message(filters.command("id"))
 async def id_command(client, message: Message):
-    sender_id = message.from_user.id
-    sender_id_type = type(sender_id).__name__
-    admin_id_from_env = ADMIN_ID
-    admin_id_type = type(admin_id_from_env).__name__
-    is_match = sender_id == admin_id_from_env
-
-    reply_text = (
-        "🔬 **Diagnostic Report** 🔬\n\n"
-        f"**The bot sees YOUR User ID as:**\n`{sender_id}` (Type: `{sender_id_type}`)\n\n"
-        f"**The bot has this ADMIN_ID configured:**\n`{admin_id_from_env}` (Type: `{admin_id_type}`)\n\n"
-        f"**Do they match exactly?** -> **{is_match}**"
-    )
-    await message.reply_text(reply_text)
+    await message.reply_text(f"I am online. Your User ID is: <code>{message.from_user.id}</code>")
 
 @app.on_message(filters.command("start") & admin_filter)
 async def start_command(client, message: Message):
-    await message.reply_text("👋 **Forwarder Config Manager**\n\nCommands: /getconfig, /setconfig, /redeploy")
+    await message.reply_text(
+        "👋 **Forwarder Config Manager**\n\n"
+        "**Commands:**\n"
+        "`/getconfig` - View the current JSON config.\n"
+        "`/setconfig` - Reply to a JSON message to set it as the new config.\n"
+        "`/redeploy` - Manually trigger a redeploy of the forwarder bot."
+    )
 
-# (The rest of your /getconfig, /setconfig commands go here)
-# ...
+@app.on_message(filters.command("getconfig") & admin_filter)
+async def get_config_command(client, message: Message):
+    msg = await message.reply_text("Fetching config from Koyeb...")
+    definition = get_current_definition()
+    if not definition:
+        await msg.edit_text("❌ Failed to fetch service definition."); return
+
+    for env_var in definition.get("env", []):
+        if env_var.get("key") == "CONFIG_JSON":
+            try:
+                pretty_json = json.dumps(json.loads(env_var["value"]), indent=2)
+                await msg.edit_text(f"Current `CONFIG_JSON`:\n\n<code>{pretty_json}</code>")
+            except json.JSONDecodeError:
+                await msg.edit_text(f"Found `CONFIG_JSON` but it contains invalid JSON:\n\n<code>{env_var['value']}</code>")
+            return
+    await msg.edit_text("`CONFIG_JSON` variable not found on the service.")
+
+@app.on_message(filters.command("setconfig") & admin_filter)
+async def set_config_command(client, message: Message):
+    if not message.reply_to_message or not message.reply_to_message.text:
+        await message.reply_text("Please reply to a message containing the new JSON configuration."); return
+
+    new_config_str = message.reply_to_message.text
+    try:
+        json.loads(new_config_str)
+    except json.JSONDecodeError:
+        await message.reply_text("❌ The replied message does not contain valid JSON. Please check the format."); return
+
+    msg = await message.reply_text("Fetching current service definition...")
+    definition = get_current_definition()
+    if not definition:
+        await msg.edit_text("❌ Failed to fetch service definition."); return
+
+    env_vars = definition.get("env", [])
+    config_found = False
+    for i, env_var in enumerate(env_vars):
+        if env_var.get("key") == "CONFIG_JSON":
+            env_vars[i]["value"] = new_config_str
+            config_found = True
+            break
+    if not config_found:
+        env_vars.append({"key": "CONFIG_JSON", "value": new_config_str})
+    
+    await msg.edit_text("Updating config on Koyeb and triggering redeploy...")
+    if update_koyeb_env(env_vars):
+        await msg.edit_text("✅ Success! The new configuration has been set. The forwarder bot is now restarting.")
+    else:
+        await msg.edit_text("❌ Failed to update the configuration on Koyeb.")
+
+@app.on_message(filters.command("redeploy") & admin_filter)
+async def redeploy_command(client, message: Message):
+    redeploy_url = f"{KOYEB_API_URL}/redeploy"
+    try:
+        response = requests.post(redeploy_url, headers=KOYEB_HEADERS)
+        response.raise_for_status()
+        await message.reply_text("✅ Redeploy command sent successfully!")
+    except Exception as e:
+        await message.reply_text(f"❌ Failed to trigger redeploy: {e}")
 
 # --- Main Application Start ---
 if __name__ == "__main__":
