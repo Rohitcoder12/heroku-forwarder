@@ -1,4 +1,4 @@
-# main.py (Corrected version with manual download/upload)
+# main.py (Final version: Bot sends the file)
 import os
 import re
 import logging
@@ -41,8 +41,7 @@ async def bot_start_handler(event):
 async def bot_save_handler(event):
     link_match = re.search(r'https?://t\.me/\S+', event.raw_text)
     if not link_match:
-        await event.reply("Please send me a valid Telegram message link.")
-        return
+        return # Ignore messages without links
         
     link = link_match.group(0)
     reply_msg = await event.reply("⏳ `Processing link...`")
@@ -56,39 +55,35 @@ async def bot_save_handler(event):
         is_private, chat_id_str, msg_id = match.groups()
         chat = int(f"-100{chat_id_str}") if is_private else chat_id_str
         
-        await bot_client.edit_message(reply_msg, "⏳ `Fetching message details...`")
         message_to_save = await user_client.get_messages(chat, ids=int(msg_id))
         
         if not message_to_save:
             raise ValueError("Message not found or I can't access it.")
 
         # ================== THE FIX IS HERE ==================
-        # Instead of just sending the message object, we check if it has media.
-        # If it does, we download it and re-upload it. If not, we just send the text.
+        # The BOT_CLIENT is now sending the final message, not the USER_CLIENT.
         
         if message_to_save.media:
-            await bot_client.edit_message(reply_msg, "⏳ `Bypassing restriction... Downloading file...`")
-            # Download the media content into memory
+            await bot_client.edit_message(reply_msg, "⏳ `Downloading...`")
             file_content = await user_client.download_media(message_to_save, file=bytes)
             
-            await bot_client.edit_message(reply_msg, "⏳ `Uploading to you...`")
-            # Send the downloaded content as a new file, with the original caption
-            await user_client.send_file(
+            await bot_client.edit_message(reply_msg, "⏳ `Uploading...`")
+            await bot_client.send_file(
                 OWNER_ID,
                 file=file_content,
                 caption=message_to_save.text
             )
         elif message_to_save.text:
-            # If it's just a text message, send the text directly
-            await user_client.send_message(OWNER_ID, message_to_save.text)
+            # If it's just a text message, the bot sends the text
+            await bot_client.send_message(OWNER_ID, message_to_save.text)
         else:
-            # If the message is empty for some reason
             await bot_client.edit_message(reply_msg, "🤔 The message seems to be empty or unsupported.")
             return
 
         # ======================================================
 
-        await bot_client.edit_message(reply_msg, "✅ **Post Saved!** I've sent it to your private chat.")
+        # For a cleaner experience, delete the "Processing..." status message
+        await bot_client.delete_messages(event.chat_id, reply_msg)
 
     except Exception as e:
         logging.error(f"Error processing link {link}: {e}")
