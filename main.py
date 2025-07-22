@@ -1,4 +1,4 @@
-# main.py (Final version: Bot sends the file)
+# main.py (Definitive "Save Everything" Version)
 import os
 import re
 import logging
@@ -32,7 +32,7 @@ bot_client = TelegramClient('bot', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 async def bot_start_handler(event):
     await event.reply(
         "**Restricted Content Saver Bot**\n\n"
-        "I am ready to save content for you.\n\n"
+        "I can save any photo, video, or file for you.\n\n"
         "**Usage:**\n"
         "Just send me a link to a private/restricted Telegram post, and I will send it back to you."
     )
@@ -41,10 +41,10 @@ async def bot_start_handler(event):
 async def bot_save_handler(event):
     link_match = re.search(r'https?://t\.me/\S+', event.raw_text)
     if not link_match:
-        return # Ignore messages without links
+        return
         
     link = link_match.group(0)
-    reply_msg = await event.reply("⏳ `Processing link...`")
+    reply_msg = await event.reply("⏳ `Processing...`")
     
     try:
         match = re.match(r'https://t.me/(c/)?(\w+)/(\d+)', link)
@@ -60,29 +60,35 @@ async def bot_save_handler(event):
         if not message_to_save:
             raise ValueError("Message not found or I can't access it.")
 
-        # ================== THE FIX IS HERE ==================
-        # The BOT_CLIENT is now sending the final message, not the USER_CLIENT.
-        
+        # This block handles ALL media types (photos, videos, files, etc.)
         if message_to_save.media:
-            await bot_client.edit_message(reply_msg, "⏳ `Downloading...`")
-            file_content = await user_client.download_media(message_to_save, file=bytes)
+            await bot_client.edit_message(reply_msg, f"⏳ `Downloading media...`")
             
-            await bot_client.edit_message(reply_msg, "⏳ `Uploading...`")
-            await bot_client.send_file(
-                OWNER_ID,
-                file=file_content,
-                caption=message_to_save.text
-            )
+            # Download to a temporary file. Telethon gives it the right name (e.g., video.mp4)
+            file_path = await user_client.download_media(message_to_save)
+            
+            await bot_client.edit_message(reply_msg, f"⏳ `Uploading to you...`")
+            try:
+                # Send the file from its path. Telethon sends it as a photo, video, or document automatically.
+                await bot_client.send_file(
+                    OWNER_ID,
+                    file=file_path,
+                    caption=message_to_save.text  # Attach the original caption
+                )
+            finally:
+                # IMPORTANT: Clean up the temporary file to save space on the server
+                os.remove(file_path)
+        
+        # This block handles messages with only text
         elif message_to_save.text:
-            # If it's just a text message, the bot sends the text
             await bot_client.send_message(OWNER_ID, message_to_save.text)
+        
+        # This block handles unsupported messages
         else:
             await bot_client.edit_message(reply_msg, "🤔 The message seems to be empty or unsupported.")
             return
 
-        # ======================================================
-
-        # For a cleaner experience, delete the "Processing..." status message
+        # Clean up the status message for a tidy chat
         await bot_client.delete_messages(event.chat_id, reply_msg)
 
     except Exception as e:
