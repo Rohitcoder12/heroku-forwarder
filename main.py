@@ -1,9 +1,11 @@
-# main.py (Definitive "Save Everything" Version)
+# main.py (With Single and Range Batch Save)
 import os
 import re
 import logging
+import asyncio
 from telethon.sync import TelegramClient, events
 from telethon.sessions import StringSession
+from telethon.errors.rpcerrorlist import MessageIdInvalidError
 
 # --- Configuration ---
 logging.basicConfig(format='[%(levelname) 5s/%(asctime)s] %(name)s: %(message)s', level=logging.INFO)
@@ -11,8 +13,7 @@ logging.basicConfig(format='[%(levelname) 5s/%(asctime)s] %(name)s: %(message)s'
 # --- Read All Configuration from Environment Variables ---
 try:
     API_ID = int(os.environ.get("API_ID"))
-    API_HASH = os.environ.get("API_HASH")
-    SESSION_STRING = os.environ.get("SESSION_STRING")
+    API_HASH = os.environ.get("API_HASHSESSION_STRING = os.environ.get("SESSION_STRING")
     BOT_TOKEN = os.environ.get("BOT_TOKEN")
     OWNER_ID = int(os.environ.get("OWNER_ID"))
 except (TypeError, ValueError) as e:
@@ -25,75 +26,124 @@ bot_client = TelegramClient('bot', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
 
 # ==============================================================================
-# === REGULAR BOT HANDLERS (Your User Interface) ===
+# === HELPER FUNCTION TO PROCESS A SINGLE MESSAGE ===
+# ==============================================================================
+async def process_message(message_id, chat_id, reply_msg):
+    """Fetches, saves, and sends a single message by its ID."""
+    try:
+        message = await user_client.get_messages(chat_id, ids=message_id)
+        if not message:
+            raise ValueError("Message not found (might have been deleted).")
+
+        if message.media:
+            file_path = await user_client.download_media(message)
+            try:
+                await bot_client.send_file(OWNER_ID, file=file_path, caption=message.text)
+            finally:
+                os.remove(file_path)
+        elif message.text:
+            await bot_client.send_message(OWNER_ID, message.text)
+        else:
+            return False # Skip empty messages
+        
+        return True # Success
+        
+    except MessageIdInvalidError:
+        logging.warning(f"Message ID {message_id} is invalid or deleted. Skipping.")
+        return False # This ID doesn't exist, so we skip it.
+    except Exception as e:
+        logging.error(f"Failed to process message {message_id}: {e}")
+        await bot_client.send_message(OWNER_ID, f"❌ Failed to save message `{message_id}`\n**Reason:** {e}")
+        return False
+
+
+# ==============================================================================
+# === MAIN BOT HANDLER ===
 # ==============================================================================
 
 @bot_client.on(events.NewMessage(pattern='/start', from_users=OWNER_ID))
 async def bot_start_handler(event):
     await event.reply(
         "**Restricted Content Saver Bot**\n\n"
-        "I can save any photo, video, or file for you.\n\n"
-        "**Usage:**\n"
-        "Just send me a link to a private/restricted Telegram post, and I will send it back to you."
+        "I can save posts in two ways:\n\n"
+        "**1. Single Mode:**\n"
+        "Send me one Telegram message link to save that specific post.\n\n"
+        "**2. Range Batch Mode:**\n"
+        "Send me a message containing exactly **two links** (the start and end message). I will download everything between them (inclusive)."
     )
 
-@bot_client.on(events.NewMessage(pattern=r'(?i).*/save|https?://t\.me/.*', from_users=OWNER_ID))
+@bot_client.on(events.NewMessage(pattern=r'https?://t\.me/.*', from_users=OWNER_ID))
 async def bot_save_handler(event):
-    link_match = re.search(r'https?://t\.me/\S+', event.raw_text)
-    if not link_match:
+    links = re.findall(r'https?://t\.me/\S+', event.raw_text)
+    if not links:
         return
-        
-    link = link_match.group(0)
-    reply_msg = await event.reply("⏳ `Processing...`")
-    
-    try:
-        match = re.match(r'https://t.me/(c/)?(\w+)/(\d+)', link)
+
+    reply_msg = await event.reply("⏳ `Analyzing links...`")
+
+    # --- SINGLE LINK MODE ---
+    if len(links) == 1:
+        await bot_client.edit_message(reply_msg, "Processing single link...")
+        match = re.match(r'https?://t\.me/(c/)?(\w+)/(\d+)', links[0])
         if not match:
-            await bot_client.edit_message(reply_msg, "❌ **Invalid Link Format.**")
+            await bot_client.edit_message(reply_msg, "❌ Invalid link format.")
             return
 
-        is_private, chat_id_str, msg_id = match.groups()
-        chat = int(f"-100{chat_id_str}") if is_private else chat_id_str
+        is_private, chat_id_str, msg_id_str = match.groups()
+        chat_id = int(f"-100{chat_id_str}") if is_private else chat_id_str
+        msg_id = int(msg_id_str)
         
-        message_to_save = await user_client.get_messages(chat, ids=int(msg_id))
-        
-        if not message_to_save:
-            raise ValueError("Message not found or I can't access it.")
-
-        # This block handles ALL media types (photos, videos, files, etc.)
-        if message_to_save.media:
-            await bot_client.edit_message(reply_msg, f"⏳ `Downloading media...`")
-            
-            # Download to a temporary file. Telethon gives it the right name (e.g., video.mp4)
-            file_path = await user_client.download_media(message_to_save)
-            
-            await bot_client.edit_message(reply_msg, f"⏳ `Uploading to you...`")
-            try:
-                # Send the file from its path. Telethon sends it as a photo, video, or document automatically.
-                await bot_client.send_file(
-                    OWNER_ID,
-                    file=file_path,
-                    caption=message_to_save.text  # Attach the original caption
-                )
-            finally:
-                # IMPORTANT: Clean up the temporary file to save space on the server
-                os.remove(file_path)
-        
-        # This block handles messages with only text
-        elif message_to_save.text:
-            await bot_client.send_message(OWNER_ID, message_to_save.text)
-        
-        # This block handles unsupported messages
-        else:
-            await bot_client.edit_message(reply_msg, "🤔 The message seems to be empty or unsupported.")
-            return
-
-        # Clean up the status message for a tidy chat
+        await process_message(msg_id, chat_id, reply_msg)
         await bot_client.delete_messages(event.chat_id, reply_msg)
 
-    except Exception as e:
-        logging.error(f"Error processing link {link}: {e}")
-        await bot_client.edit_message(reply_msg, f"❌ **An error occurred:**\n`{e}`")
+    # --- RANGE BATCH MODE ---
+    elif len(links) == 2:
+        try:
+            # Parse start link
+            start_match = re.match(r'https?://t\.me/(c/)?(\w+)/(\d+)', links[0])
+            # Parse end link
+            end_match = re.match(r'https?://t\.me/(c/)?(\w+)/(\d+)', links[1])
+
+            if not start_match or not end_match:
+                raise ValueError("One or both links have an invalid format.")
+
+            start_is_private, start_chat_str, start_id_str = start_match.groups()
+            end_is_private, end_chat_str, end_id_str = end_match.groups()
+            
+            # Ensure links are from the same chat
+            if start_chat_str != end_chat_str:
+                raise ValueError("Links are from different chats. Batch mode requires both links to be from the same chat.")
+
+            chat_id = int(f"-100{start_chat_str}") if start_is_private else start_chat_str
+            start_id = int(start_id_str)
+            end_id = int(end_id_str)
+
+            # Ensure start ID is less than end ID
+            if start_id > end_id:
+                start_id, end_id = end_id, start_id # Swap them
+
+            total_messages = (end_id - start_id) + 1
+            await bot_client.edit_message(reply_msg, f"✅ Range detected. Starting batch save for {total_messages} messages...")
+            
+            success_count = 0
+            # Iterate through the entire range of message IDs
+            for i, current_msg_id in enumerate(range(start_id, end_id + 1), 1):
+                await bot_client.edit_message(reply_msg, f"Processing message {i}/{total_messages} (ID: `{current_msg_id}`)...")
+                if await process_message(current_msg_id, chat_id, reply_msg):
+                    success_count += 1
+                
+                # Add a delay to prevent flooding Telegram's API
+                await asyncio.sleep(3)
+
+            await bot_client.edit_message(reply_msg, f"✅ **Batch Complete!**\nSaved {success_count}/{total_messages} messages.")
+
+        except ValueError as e:
+            await bot_client.edit_message(reply_msg, f"❌ **Error:** {e}")
+        except Exception as e:
+            await bot_client.edit_message(reply_msg, f"❌ **An unexpected error occurred:**\n`{e}`")
+
+    # --- INVALID NUMBER OF LINKS ---
+    else:
+        await bot_client.edit_message(reply_msg, "Please send either 1 link for a single save, or 2 links for a range batch save.")
 
 
 # ==============================================================================
