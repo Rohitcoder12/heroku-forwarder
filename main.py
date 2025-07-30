@@ -1,4 +1,4 @@
-# main.py (With Automatic Real-time Saver)
+# main.py (Final version with Album/Media Group support)
 import os
 import re
 import logging
@@ -10,161 +10,183 @@ from telethon.errors.rpcerrorlist import MessageIdInvalidError
 # --- Configuration ---
 logging.basicConfig(format='[%(levelname) 5s/%(asctime)s] %(name)s: %(message)s', level=logging.INFO)
 
-# --- Read All Configuration from Environment Variables ---
+# --- Read Environment Variables ---
 try:
     API_ID = int(os.environ.get("API_ID"))
     API_HASH = os.environ.get("API_HASH")
     SESSION_STRING = os.environ.get("SESSION_STRING")
     BOT_TOKEN = os.environ.get("BOT_TOKEN")
     OWNER_ID = int(os.environ.get("OWNER_ID"))
-    
-    # Optional: The ID of your private log channel
     LOG_CHANNEL_ID = os.environ.get("LOG_CHANNEL_ID")
-    if LOG_CHANNEL_ID:
-        LOG_CHANNEL_ID = int(LOG_CHANNEL_ID)
-
-    # NEW: The ID or username of the source bot to monitor
-    # Optional. If not set, this feature is disabled.
+    if LOG_CHANNEL_ID: LOG_CHANNEL_ID = int(LOG_CHANNEL_ID)
     SOURCE_BOT_ID = os.environ.get("SOURCE_BOT_ID")
-    if SOURCE_BOT_ID and SOURCE_BOT_ID.lstrip('-').isnumeric():
-        SOURCE_BOT_ID = int(SOURCE_BOT_ID)
-
+    if SOURCE_BOT_ID and SOURCE_BOT_ID.lstrip('-').isnumeric(): SOURCE_BOT_ID = int(SOURCE_BOT_ID)
 except (TypeError, ValueError) as e:
     logging.critical(f"ERROR: A required environment variable is missing or invalid: {e}")
     exit(1)
 
-# --- Initialize BOTH clients ---
+# --- Initialize Clients ---
 user_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 bot_client = TelegramClient('bot', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
 
 # ==============================================================================
-# === AUTOMATIC REAL-TIME SAVER ===
-# This handler runs on the user_client to see messages from the source bot
+# === HELPER FUNCTIONS ===
+# ==============================================================================
+
+async def log_message(message_to_log):
+    if LOG_CHANNEL_ID and message_to_log:
+        try:
+            # If it's a list (album), forward the whole list
+            if isinstance(message_to_log, list):
+                await bot_client.forward_messages(entity=LOG_CHANNEL_ID, messages=message_to_log)
+            else:
+                await bot_client.forward_messages(entity=LOG_CHANNEL_ID, messages=[message_to_log])
+        except Exception as e:
+            logging.error(f"Failed to log message: {e}")
+
+async def process_and_send(message, destination):
+    """Downloads, sends, and cleans up a single media item or a text message."""
+    if message.media:
+        file_path = await user_client.download_media(message, file=f"downloads/{message.id}")
+        try:
+            sent_message = await bot_client.send_file(destination, file=file_path, caption=message.text)
+            return sent_message, file_path
+        except Exception:
+            os.remove(file_path) # Clean up if sending fails
+            raise
+    elif message.text:
+        sent_message = await bot_client.send_message(destination, message.text)
+        return sent_message, None
+    return None, None
+
+
+# ==============================================================================
+# === AUTOMATIC SAVER (Now Album-Aware) ===
 # ==============================================================================
 if SOURCE_BOT_ID and LOG_CHANNEL_ID:
+    processed_groups = set() # To avoid processing each item of an album individually
+    
     @user_client.on(events.NewMessage(from_users=SOURCE_BOT_ID))
     async def auto_saver_handler(event):
-        """Monitors the source bot and auto-saves new videos to the log channel."""
-        logging.info(f"New message received from source bot: {SOURCE_BOT_ID}")
+        message = event.message
+        grouped_id = message.grouped_id
 
-        # Check if the message contains a video
-        # Some bots send videos as documents, so we check the mime_type
-        is_video = event.message.video or (
-            event.message.document and 'video' in getattr(event.message.document, 'mime_type', '')
-        )
-
-        if is_video:
-            logging.info("Video detected! Starting automatic save process...")
-            try:
-                # Use the reliable download-to-file and re-upload method
-                file_path = await user_client.download_media(event.message)
-                try:
-                    await bot_client.send_file(
-                        LOG_CHANNEL_ID,
-                        file=file_path,
-                        caption=event.message.text
-                    )
-                    logging.info(f"Successfully saved video from {SOURCE_BOT_ID} to log channel {LOG_CHANNEL_ID}")
-                finally:
-                    os.remove(file_path) # Clean up the temporary file
-            except Exception as e:
-                logging.error(f"Auto-save failed: {e}")
+        # If it's part of a group and we've already processed this group, skip.
+        if grouped_id and grouped_id in processed_groups:
+            return
+        
+        # If it's part of a group, add it to the set so we don't process other items.
+        if grouped_id:
+            processed_groups.add(grouped_id)
+            # Give Telegram a moment to receive all parts of the album
+            await asyncio.sleep(2)
+            # Fetch all messages in the album
+            album_messages = await user_client.get_messages(message.chat_id, ids=grouped_id)
         else:
-            logging.info("Message is not a video, ignoring.")
+            # It's a single message, not an album
+            album_messages = [message]
+
+        logging.info(f"Auto-saving {len(album_messages)} message(s)...")
+        
+        media_to_send = []
+        try:
+            for msg in album_messages:
+                # Use download_media to get the file path
+                downloaded_path = await user_client.download_media(msg, file=f"downloads/{msg.id}")
+                media_to_send.append(downloaded_path)
+            
+            # Send all downloaded files as a single album
+            sent_messages = await bot_client.send_file(
+                LOG_CHANNEL_ID,
+                file=media_to_send,
+                caption=album_messages[0].text if album_messages else "" # Use caption from the first item
+            )
+            await log_message(sent_messages)
+
+        except Exception as e:
+            logging.error(f"Auto-save failed for group {grouped_id}: {e}")
+        finally:
+            # Clean up all downloaded files
+            for path in media_to_send:
+                if os.path.exists(path):
+                    os.remove(path)
+            # Clear the processed group ID from memory after a while
+            if grouped_id:
+                await asyncio.sleep(60)
+                processed_groups.discard(grouped_id)
 
 # ==============================================================================
-# === MANUAL SAVER (Triggered by you via links) ===
-# This section remains unchanged and will continue to work.
+# === MANUAL SAVER (Now Album-Aware) ===
 # ==============================================================================
-
 @bot_client.on(events.NewMessage(pattern='/start', from_users=OWNER_ID))
 async def bot_start_handler(event):
-    await event.reply(
-        "**Restricted Content Saver Bot**\n\n"
-        "**Automatic Mode:** I am monitoring the source bot for new videos.\n"
-        "**Manual Mode:** Send me links to save content manually."
-    )
-
-# The rest of the manual link-handling code is the same...
-# (Helper function and link handler)
-
-async def process_and_log_message(message_id, chat_id):
-    try:
-        message = await user_client.get_messages(chat_id, ids=message_id)
-        if not message: raise ValueError("Message not found.")
-        sent_message = None
-        if message.media:
-            file_path = await user_client.download_media(message)
-            try:
-                sent_message = await bot_client.send_file(OWNER_ID, file=file_path, caption=message.text)
-            finally:
-                os.remove(file_path)
-        elif message.text:
-            sent_message = await bot_client.send_message(OWNER_ID, message.text)
-        else:
-            return False
-        if LOG_CHANNEL_ID and sent_message:
-            await bot_client.forward_messages(entity=LOG_CHANNEL_ID, messages=sent_message)
-        return True
-    except Exception as e:
-        logging.error(f"Manual save failed for message {message_id}: {e}")
-        await bot_client.send_message(OWNER_ID, f"❌ Failed to save message `{message_id}`\n**Reason:** {e}")
-        return False
+    await event.reply("Album-Aware Saver Bot is running.")
 
 @bot_client.on(events.NewMessage(pattern=r'https?://t\.me/.*', from_users=OWNER_ID))
 async def main_link_handler(event):
-    links = re.findall(r'https?://t\.me/\S+', event.raw_text)
-    if not links: return
-    reply_msg = await event.reply("⏳ `Analyzing links...`")
-    if len(links) == 1:
-        # ... single link logic ...
-        await bot_client.edit_message(reply_msg, "Processing single link...")
-        match = re.match(r'https?://t\.me/(c/)?(\w+)/(\d+)', links[0])
-        if not match: await bot_client.edit_message(reply_msg, "❌ Invalid link format."); return
-        is_private, chat_id_str, msg_id_str = match.groups()
-        chat_id = int(f"-100{chat_id_str}") if is_private else chat_id_str
-        msg_id = int(msg_id_str)
-        await process_and_log_message(msg_id, chat_id)
-        await bot_client.delete_messages(event.chat_id, reply_msg)
-    elif len(links) == 2:
-        # ... range batch logic ...
+    # This handler will only process the first link to identify the album/message
+    link = re.search(r'https?://t\.me/\S+', event.raw_text).group(0)
+    reply_msg = await event.reply("⏳ `Processing link...`")
+    
+    try:
+        match = re.match(r'https?://t\.me/(c/)?(\w+)/(\d+)', link)
+        if not match: raise ValueError("Invalid link format.")
+        
+        is_private, chat_str, msg_id = match.groups()
+        chat_id = int(f"-100{chat_str}") if is_private else chat_str
+        
+        message = await user_client.get_messages(chat_id, ids=int(msg_id))
+        if not message: raise ValueError("Message not found.")
+
+        # Check for media group
+        if message.grouped_id:
+            await bot_client.edit_message(reply_msg, f"Album detected. Fetching {message.grouped_id}...")
+            album_messages = await user_client.get_messages(chat_id, ids=message.grouped_id)
+        else:
+            album_messages = [message]
+
+        await bot_client.edit_message(reply_msg, f"Downloading {len(album_messages)} item(s)...")
+
+        media_to_send = []
+        paths_to_clean = []
         try:
-            start_match = re.match(r'https?://t\.me/(c/)?(\w+)/(\d+)', links[0])
-            end_match = re.match(r'https?://t\.me/(c/)?(\w+)/(\d+)', links[1])
-            if not start_match or not end_match: raise ValueError("Invalid link format.")
-            start_chat_str = start_match.group(2)
-            end_chat_str = end_match.group(2)
-            if start_chat_str != end_chat_str: raise ValueError("Links must be from the same chat.")
-            chat_id = int(f"-100{start_chat_str}") if start_match.group(1) else start_chat_str
-            start_id, end_id = sorted([int(start_match.group(3)), int(end_match.group(3))])
-            total_messages = (end_id - start_id) + 1
-            await bot_client.edit_message(reply_msg, f"✅ Range detected. Saving {total_messages} messages...")
-            success_count = 0
-            for i, current_msg_id in enumerate(range(start_id, end_id + 1), 1):
-                await bot_client.edit_message(reply_msg, f"Processing {i}/{total_messages}...")
-                if await process_and_log_message(current_msg_id, chat_id):
-                    success_count += 1
-                await asyncio.sleep(3)
-            await bot_client.edit_message(reply_msg, f"✅ **Batch Complete!** Saved {success_count}/{total_messages}.")
-        except Exception as e:
-            await bot_client.edit_message(reply_msg, f"❌ **Error:** {e}")
-    else:
-        await bot_client.edit_message(reply_msg, "Please send 1 or 2 links for manual save.")
+            for i, msg in enumerate(album_messages):
+                path = await user_client.download_media(msg, file=f"downloads/{msg.id}")
+                media_to_send.append(path)
+                paths_to_clean.append(path)
+
+            # Send as a grouped album
+            sent_messages = await bot_client.send_file(
+                OWNER_ID,
+                file=media_to_send,
+                caption=album_messages[0].text if album_messages else ""
+            )
+            await log_message(sent_messages)
+
+        finally:
+            # Clean up downloaded files
+            for path in paths_to_clean:
+                if os.path.exists(path): os.remove(path)
+
+        await bot_client.delete_messages(event.chat_id, reply_msg)
+
+    except Exception as e:
+        await bot_client.edit_message(reply_msg, f"❌ **Error:** {e}")
 
 # ==============================================================================
 # === MAIN EXECUTION BLOCK ===
 # ==============================================================================
 async def main():
+    # Create a directory for downloads if it doesn't exist
+    if not os.path.isdir('downloads'):
+        os.makedirs('downloads')
+
     await user_client.start()
     logging.info(f"User-Bot logged in as: {(await user_client.get_me()).first_name}")
     logging.info(f"Saver Bot running as: @{(await bot_client.get_me()).username}")
-    if SOURCE_BOT_ID:
-        logging.info(f"Auto-saver activated for source: {SOURCE_BOT_ID}")
-    else:
-        logging.info("Auto-saver is disabled (SOURCE_BOT_ID not set).")
-    if LOG_CHANNEL_ID:
-        logging.info(f"Logging enabled to channel: {LOG_CHANNEL_ID}")
+    if SOURCE_BOT_ID: logging.info(f"Auto-saver activated for source: {SOURCE_BOT_ID}")
+    if LOG_CHANNEL_ID: logging.info(f"Logging enabled to channel: {LOG_CHANNEL_ID}")
     logging.info("System is live.")
     await user_client.run_until_disconnected()
     await bot_client.run_until_disconnected()
