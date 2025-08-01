@@ -1,4 +1,4 @@
-# main.py (Definitive Fix for Range Batch and All Features)
+# main.py (Final Definitive Fix for Batch Mode and All Features)
 import os
 import re
 import logging
@@ -29,41 +29,27 @@ bot_client = TelegramClient('bot', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
 
 # ==============================================================================
-# === CORE HELPER FUNCTION: To send a clean copy of any message ===
+# === HELPER: Sends a list of messages as a clean copy (album or single) ===
 # ==============================================================================
-async def send_clean_copy(message, destination_id):
-    """
-    Intelligently handles sending a clean copy of a message.
-    It detects albums and sends them correctly.
-    """
-    if not message: return
+async def send_as_copy(messages_to_send, destination_id):
+    if not messages_to_send: return
 
-    # Use a try-finally block to ensure cleanup happens
     paths_to_clean = []
     try:
-        album_messages = []
-        if message.grouped_id:
-            album_messages = await user_client.get_messages(message.chat, ids=message.grouped_id)
-            if not album_messages: album_messages = [message]
-        else:
-            album_messages = [message]
-
         media_to_send = []
-        caption = album_messages[0].text
+        caption = messages_to_send[0].text
         
-        for msg in album_messages:
+        for msg in messages_to_send:
             if msg and msg.media:
                 path = await msg.download_media(file=f"downloads/{msg.id}")
-                media_to_send.append(path)
                 paths_to_clean.append(path)
+                media_to_send.append(path)
         
         if media_to_send:
             await bot_client.send_file(destination_id, file=media_to_send, caption=caption)
         elif caption:
             await bot_client.send_message(destination_id, caption)
-        
-        # Return the grouped_id if it was an album, for tracking
-        return message.grouped_id
+
     finally:
         for path in paths_to_clean:
             if os.path.exists(path):
@@ -97,15 +83,20 @@ async def main_link_handler(event):
             
         chat_peer = await user_client.get_entity(PeerChannel(int(first_chat_str)))
 
-        # --- SINGLE LINK MODE (Handles both single posts and albums) ---
+        # --- SINGLE LINK MODE ---
         if len(matches) == 1:
             msg_id = int(matches[0].group(3))
             message = await user_client.get_messages(chat_peer, ids=msg_id)
             if not message: raise ValueError("Message not found.")
 
-            await bot_client.edit_message(reply_msg, "Saving post...")
-            await send_clean_copy(message, OWNER_ID)
-            if LOG_CHANNEL_ID: await send_clean_copy(message, LOG_CHANNEL_ID)
+            messages_to_process = []
+            if message.grouped_id:
+                messages_to_process = await user_client.get_messages(chat_peer, ids=message.grouped_id)
+            else:
+                messages_to_process = [message]
+            
+            await send_as_copy(messages_to_process, OWNER_ID)
+            if LOG_CHANNEL_ID: await send_as_copy(messages_to_process, LOG_CHANNEL_ID)
 
         # --- REBUILT RANGE BATCH MODE ---
         elif len(matches) == 2:
@@ -113,39 +104,40 @@ async def main_link_handler(event):
             
             await bot_client.edit_message(reply_msg, f"Range detected. Fetching all messages from {start_id} to {end_id}...")
             
-            # Fetch all messages in the range in one efficient call
-            all_messages = await user_client.get_messages(chat_peer, min_id=start_id - 1, max_id=end_id + 1)
+            all_messages_in_range = await user_client.get_messages(chat_peer, min_id=start_id - 1, max_id=end_id + 1)
+            if not all_messages_in_range: raise ValueError("No messages found in the specified range.")
             
-            if not all_messages: raise ValueError("No messages found in the specified range.")
-            
-            all_messages.reverse() # Sort from oldest to newest
-            total_count = len(all_messages)
+            all_messages_in_range.reverse()
+            total_count = len(all_messages_in_range)
             
             processed_groups = set()
-            for i, message in enumerate(all_messages, 1):
+            for i, message in enumerate(all_messages_in_range, 1):
                 if not message: continue
 
-                # If we are processing an album, skip if we've already done this group
-                if message.grouped_id and message.grouped_id in processed_groups:
-                    continue
-
-                await bot_client.edit_message(reply_msg, f"Processing {i}/{total_count} (ID: `{message.id}`)...")
-                
                 try:
-                    # The helper function will handle if it's an album or single post
-                    processed_group_id = await send_clean_copy(message, OWNER_ID)
-                    if LOG_CHANNEL_ID: await send_clean_copy(message, LOG_CHANNEL_ID)
+                    current_grouped_id = message.grouped_id
+                    if current_grouped_id and current_grouped_id in processed_groups:
+                        continue
 
-                    # If an album was processed, add its ID to our set
-                    if processed_group_id:
-                        processed_groups.add(processed_group_id)
+                    await bot_client.edit_message(reply_msg, f"Processing {i}/{total_count} (ID: `{message.id}`)...")
 
-                    await asyncio.sleep(3)
+                    messages_to_process = []
+                    if current_grouped_id:
+                        # Find all parts of this album within the list we already fetched
+                        messages_to_process = [m for m in all_messages_in_range if m and m.grouped_id == current_grouped_id]
+                        processed_groups.add(current_grouped_id)
+                    else:
+                        messages_to_process = [message]
+                    
+                    await send_as_copy(messages_to_process, OWNER_ID)
+                    if LOG_CHANNEL_ID: await send_as_copy(messages_to_process, LOG_CHANNEL_ID)
+
+                    await asyncio.sleep(4) # A slightly longer delay for batches
                 except Exception as e:
                     logging.error(f"Error in batch for msg {message.id}: {e}")
-                    await event.respond(f"⚠️ Skipped message `{message.id}` due to error.")
+                    await event.respond(f"⚠️ Skipped message `{message.id}` due to an error.")
                     continue
-
+            
             await bot_client.edit_message(reply_msg, "✅ Batch Complete!")
             return
 
