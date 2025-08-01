@@ -1,4 +1,4 @@
-# main.py (Definitive Fix for Large Chat ID and All Features)
+# main.py (Definitive version with correct Album/Single/Range handling and clean logging)
 import os
 import re
 import logging
@@ -29,21 +29,62 @@ bot_client = TelegramClient('bot', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
 
 # ==============================================================================
-# === HELPER FUNCTIONS ===
+# === CORE HELPER FUNCTION: To send a clean copy of any message ===
 # ==============================================================================
-async def log_message(message_to_log):
-    if LOG_CHANNEL_ID and message_to_log:
-        try:
-            if isinstance(message_to_log, list): await bot_client.forward_messages(entity=LOG_CHANNEL_ID, messages=message_to_log)
-            else: await bot_client.forward_messages(entity=LOG_CHANNEL_ID, messages=[message_to_log])
-        except Exception as e: logging.error(f"Failed to log message: {e}")
+async def send_clean_copy(message, destination_id):
+    """
+    Intelligently handles sending a clean copy of a message.
+    It detects albums and sends them correctly.
+    """
+    if not message:
+        return
+
+    album_messages = []
+    # 1. Check if the message is part of an album
+    if message.grouped_id:
+        # Fetch all messages that share the same group ID
+        album_messages = await user_client.get_messages(message.chat, ids=message.grouped_id)
+        if not album_messages: # Safety check
+             album_messages = [message]
+    else:
+        # It's a single message
+        album_messages = [message]
+
+    media_to_send = []
+    paths_to_clean = []
+    caption = album_messages[0].text # Use caption from the first item
+    
+    try:
+        # 2. Download all media in the message/album
+        for msg in album_messages:
+            if msg and msg.media:
+                path = await msg.download_media(file=f"downloads/{msg.id}")
+                media_to_send.append(path)
+                paths_to_clean.append(path)
+        
+        # 3. Send the content
+        if media_to_send:
+            # send_file with a list of paths automatically creates an album
+            await bot_client.send_file(destination_id, file=media_to_send, caption=caption)
+        elif caption: # Handle text-only messages
+             await bot_client.send_message(destination_id, caption)
+
+    finally:
+        # 4. Clean up all downloaded temporary files
+        for path in paths_to_clean:
+            if os.path.exists(path):
+                os.remove(path)
 
 # ==============================================================================
-# === MANUAL SAVER HANDLER ===
+# === MAIN BOT HANDLER ===
 # ==============================================================================
 @bot_client.on(events.NewMessage(pattern='/start', from_users=OWNER_ID))
 async def bot_start_handler(event):
-    await event.reply("Album-Aware Saver Bot is running. Send me 1 or 2 message links.")
+    await event.reply(
+        "**Advanced Content Saver**\n\n"
+        "• **Single Post/Album:** Send 1 link.\n"
+        "• **Batch Range:** Send 2 links to save everything in between."
+    )
 
 @bot_client.on(events.NewMessage(pattern=r'https?://t\.me/.*', from_users=OWNER_ID))
 async def main_link_handler(event):
@@ -53,74 +94,61 @@ async def main_link_handler(event):
     reply_msg = await event.reply("⏳ `Processing...`")
     
     try:
-        # --- PARSE LINKS AND CHAT ID ---
+        # --- PARSE LINKS AND CHAT PEER ---
         matches = [re.match(r'https?://t\.me/(c/)?(\w+)/(\d+)', link) for link in links]
-        if not all(matches): raise ValueError("One or more links have an invalid format.")
-
-        # Ensure all links are from the same chat for simplicity
+        if not all(matches): raise ValueError("Invalid link format.")
+        
         first_chat_str = matches[0].group(2)
         if not all(m.group(2) == first_chat_str for m in matches):
             raise ValueError("All links must be from the same chat.")
-
-        # ================== THE DEFINITIVE FIX ==================
-        # Construct the peer using a method that supports large numbers
-        # A private channel link t.me/c/123... has an ID of 123...
-        # Telethon represents this as PeerChannel(channel_id=123...)
-        # We don't need to add the -100 prefix ourselves.
+            
         chat_peer = await user_client.get_entity(PeerChannel(int(first_chat_str)))
-        # ========================================================
 
-        # --- SINGLE LINK / ALBUM MODE ---
+        # --- SINGLE LINK MODE (Handles both single posts and albums) ---
         if len(matches) == 1:
             msg_id = int(matches[0].group(3))
             message = await user_client.get_messages(chat_peer, ids=msg_id)
             if not message: raise ValueError("Message not found.")
 
-            album_messages = []
-            if message.grouped_id:
-                await bot_client.edit_message(reply_msg, f"Album detected. Fetching group...")
-                album_messages = await user_client.get_messages(chat_peer, ids=message.grouped_id)
-            else:
-                album_messages = [message]
-            
-            await bot_client.edit_message(reply_msg, f"Downloading {len(album_messages)} item(s)...")
+            await bot_client.edit_message(reply_msg, "Saving post...")
+            await send_clean_copy(message, OWNER_ID)
+            if LOG_CHANNEL_ID:
+                await send_clean_copy(message, LOG_CHANNEL_ID)
 
-        # --- RANGE BATCH MODE ---
+        # --- RANGE BATCH MODE (Processes each item in range individually) ---
         elif len(matches) == 2:
             start_id, end_id = sorted([int(m.group(3)) for m in matches])
             total_count = end_id - start_id + 1
-            await bot_client.edit_message(reply_msg, f"Range detected. Fetching {total_count} messages...")
-            # Fetch all messages in the range at once
-            album_messages = await user_client.get_messages(chat_peer, min_id=start_id-1, max_id=end_id+1, limit=total_count)
-            album_messages.reverse() # a-z
-        else:
-            raise ValueError("Please send either 1 link or 2 links.")
-
-        # --- COMMON PROCESSING FOR ALL MODES ---
-        media_to_send = []; paths_to_clean = []
-        try:
-            for i, msg in enumerate(album_messages):
-                if not msg or not msg.media: continue # Skip text-only or empty messages in albums/ranges
-                await bot_client.edit_message(reply_msg, f"Downloading item {i+1}/{len(album_messages)}...")
-                path = await msg.download_media(file=f"downloads/{msg.id}")
-                media_to_send.append(path); paths_to_clean.append(path)
-
-            if not media_to_send:
-                raise ValueError("No media found in the specified message(s).")
-                
-            await bot_client.edit_message(reply_msg, f"Uploading {len(media_to_send)} item(s)...")
+            await bot_client.edit_message(reply_msg, f"Range detected. Processing {total_count} messages...")
             
-            # Send as a grouped album
-            sent_messages = await bot_client.send_file(
-                OWNER_ID,
-                file=media_to_send,
-                caption=album_messages[0].text if album_messages else ""
-            )
-            await log_message(sent_messages)
+            processed_groups = set() # To avoid saving the same album multiple times
+            for i, msg_id in enumerate(range(start_id, end_id + 1)):
+                await bot_client.edit_message(reply_msg, f"Processing {i+1}/{total_count} (ID: `{msg_id}`)...")
+                try:
+                    message = await user_client.get_messages(chat_peer, ids=msg_id)
+                    if not message: continue
 
-        finally:
-            for path in paths_to_clean:
-                if os.path.exists(path): os.remove(path)
+                    # If part of an album, check if we already processed this group
+                    if message.grouped_id and message.grouped_id in processed_groups:
+                        continue
+                    
+                    # Process and send the message/album
+                    await send_clean_copy(message, OWNER_ID)
+                    if LOG_CHANNEL_ID:
+                        await send_clean_copy(message, LOG_CHANNEL_ID)
+
+                    # If it was an album, mark the group as done
+                    if message.grouped_id:
+                        processed_groups.add(message.grouped_id)
+
+                    await asyncio.sleep(3) # Prevent flood waits
+
+                except Exception as e:
+                    logging.error(f"Error in batch for msg {msg_id}: {e}")
+                    continue # Continue to the next message
+            
+            await bot_client.edit_message(reply_msg, "✅ Batch Complete!")
+            return # Don't delete the final status message for batches
 
         await bot_client.delete_messages(event.chat_id, reply_msg)
 
@@ -134,12 +162,8 @@ async def main_link_handler(event):
 async def main():
     if not os.path.isdir('downloads'): os.makedirs('downloads')
     await user_client.start()
-    logging.info(f"User-Bot logged in as: {(await user_client.get_me()).first_name}")
-    logging.info(f"Saver Bot running as: @{(await bot_client.get_me()).username}")
-    if LOG_CHANNEL_ID: logging.info(f"Logging enabled to channel: {LOG_CHANNEL_ID}")
     logging.info("System is live.")
     await user_client.run_until_disconnected()
-    await bot_client.run_until_disconnected()
 
 if __name__ == "__main__":
     user_client.loop.run_until_complete(main())
