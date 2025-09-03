@@ -1,4 +1,3 @@
-# main.py (Final Definitive Fix for Batch Mode and All Features)
 import os
 import re
 import logging
@@ -6,6 +5,11 @@ import asyncio
 from telethon.sync import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.types import PeerChannel
+
+# --- NEW: Imports for the Web Server ---
+from flask import Flask
+import threading
+# ----------------------------------------
 
 # --- Configuration ---
 logging.basicConfig(format='[%(levelname) 5s/%(asctime)s] %(name)s: %(message)s', level=logging.INFO)
@@ -26,6 +30,22 @@ except (TypeError, ValueError) as e:
 # --- Initialize Clients ---
 user_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 bot_client = TelegramClient('bot', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
+
+
+# ==============================================================================
+# === NEW: Minimal Web Server to Satisfy Render Health Checks ===
+# ==============================================================================
+app = Flask(__name__)
+
+@app.route('/')
+def hello_world():
+    return 'Bot is alive!'
+
+def run_flask():
+    # Render provides the port to bind to in the PORT environment variable
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
+# ==============================================================================
 
 
 # ==============================================================================
@@ -56,7 +76,7 @@ async def send_as_copy(messages_to_send, destination_id):
                 os.remove(path)
 
 # ==============================================================================
-# === MAIN BOT HANDLER ===
+# === MAIN BOT HANDLER (No changes here) ===
 # ==============================================================================
 @bot_client.on(events.NewMessage(pattern='/start', from_users=OWNER_ID))
 async def bot_start_handler(event):
@@ -148,13 +168,20 @@ async def main_link_handler(event):
         await bot_client.edit_message(reply_msg, f"❌ **Error:** {e}")
 
 # ==============================================================================
-# === MAIN EXECUTION BLOCK ===
+# === MAIN EXECUTION BLOCK (Updated to run both Bot and Web Server) ===
 # ==============================================================================
-async def main():
+async def main_bot_logic():
     if not os.path.isdir('downloads'): os.makedirs('downloads')
     await user_client.start()
     logging.info("System is live.")
     await user_client.run_until_disconnected()
 
 if __name__ == "__main__":
-    user_client.loop.run_until_complete(main())
+    # Start the Flask web server in a background thread
+    flask_thread = threading.Thread(target=run_flask)
+    flask_thread.daemon = True
+    flask_thread.start()
+    
+    # Start the Telethon client in the main thread
+    logging.info("Starting Telethon client...")
+    user_client.loop.run_until_complete(main_bot_logic())
